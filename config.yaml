@@ -1,0 +1,33 @@
+prompts: "/home/server08/yoonjeon_workspace/MMAR/prompts.txt"
+
+seed: 12
+pag_scale: 0.3
+cfg: 4.5
+layer_types: "all"
+cd_beta: 1.0
+batch_size: 16
+use_ema: true
+use_llm_system_prompt: true
+more_smooth: true
+store_seperately: false
+
+defaults:
+  - override /hydra/hydra_logging@_group_: none
+  - override /hydra/job_logging@_group_: none
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  entity: 'jeoni'
+  resume: 'auto'
+  project: 'HART'
+  sweep_name: "hart-1024px"
+
+model_path: "./ckpts/hart-0.7b-1024px/llm"
+text_model_path: "./ckpts/Qwen2-VL-1.5B-Instruct"
+sample_folder_dir: "./outputs"
+max_token_length: 300
+shield_model_path: "./ckpts/shieldgemma-2b"

@@ -1,0 +1,15 @@
+# wandb sweep sweep.yaml
+program: sample.py
+method: grid  # or bayes, random
+parameters:
+  pag_scale:
+    values: [0.0, 0.3, 0.6, 0.9]
+  cfg_scale:
+    values: [3.0, 4.0, 5.0]
+  layer_types: 
+    values: ["all", "early", "middle", "late"]
+command:
+  - ${env}
+  - python3
+  - ${program}
+  - ${args_no_hyphens}
