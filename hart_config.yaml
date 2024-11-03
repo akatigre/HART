@@ -1,11 +1,15 @@
-prompts: "/home/server08/yoonjeon_workspace/MMAR/prompts.txt"
 
-seed: 12
-pag_scale: 0.3
+metadata_file: "/home/server08/yoonjeon_workspace/MMAR/eval/geneval/prompt/evaluation_metadata.jsonl"
+outdir: "/home/server08/yoonjeon_workspace/MMAR/eval/geneval/outputs/hart"
+outfile: "results.jsonl"
+model-path: "/home/server08/yoonjeon_workspace/MMAR/eval/geneval/obj_detector/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth"
+
+seed: 42
+pag_scale: 0.6
 cfg: 4.5
 layer_types: "all"
 cd_beta: 1.0
-batch_size: 16
+batch_size: 4
 use_ema: true
 use_llm_system_prompt: true
 more_smooth: true

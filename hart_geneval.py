@@ -14,14 +14,16 @@ from transformers import (
     HfArgumentParser,
     set_seed,
 )
+os.system("export PYTHONPATH='$PYTHONPATH:/home/server08/yoonjeon_workspace/MMAR/hart'")
 
+from utils import set_seed, save_images
 from hart.utils import encode_prompts, llm_system_prompt
 from change_hart import change_hart_infer, change_hart_block, change_hart_attn
 
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from utils import set_seed, save_images
+
 import logging
 from rich.logging import RichHandler
 from pathlib import Path
@@ -34,8 +36,8 @@ logging.basicConfig(
 log = logging.getLogger("rich")
 log.setLevel(logging.INFO)
 
-
-@hydra.main(config_path=".", config_name="config")
+wandb.offline = True
+@hydra.main(config_path=".", config_name="hart_config")
 def main(cfg: DictConfig):
     set_seed(cfg.seed)
     log.info(f"Set seed {cfg.seed}")
@@ -48,11 +50,17 @@ def main(cfg: DictConfig):
     folder_name = "generated"
     if enable_pag: 
         folder_name += f"_pag:{cfg.pag_scale}_layer:{cfg.layer_types}"
-    if enable_cfg: folder_name += f"_cfg{cfg.cfg}"
-    if enable_cd: folder_name += f"_cd{cfg.cd_beta}"
+        cfg.outdir += f"_PAG_{cfg.pag_scale}"
+    if enable_cfg: 
+        folder_name += f"_cfg{cfg.cfg}"
+        cfg.outdir += f"_CFG_{cfg.cfg}"
+    if enable_cd: 
+        folder_name += f"_cd{cfg.cd_beta}"
+        cfg.outdir += f"_CD_{cfg.cd_beta}"
 
-    with open(cfg.prompts, "r") as f:
-        validation_prompts = f.read().splitlines()
+    import json
+    with open(cfg.metadata_file) as f:
+        metadatas = [json.loads(line) for line in f]
 
     wandb.init(
         project=cfg.wandb.project,
@@ -103,10 +111,22 @@ def main(cfg: DictConfig):
     mini_batch_size = 2
     assert cfg.batch_size % mini_batch_size == 0
     start_time = time.time()
-    for p_idx, prompt in tqdm(enumerate(validation_prompts)):
+    for p_idx, metadata in tqdm(enumerate(metadatas)):
+        
+        outpath = os.path.join(cfg.outdir, f"{p_idx:0>5}")
+        os.makedirs(outpath, exist_ok=True)
+
+        prompt = metadata['prompt']
         log.info(f"With Prompt '{prompt}' generating {cfg.batch_size} images")
 
         prompts = [prompt] * cfg.batch_size
+
+        sample_path = os.path.join(outpath, "samples")
+        os.makedirs(sample_path, exist_ok=True)
+        with open(os.path.join(outpath, "metadata.jsonl"), "w") as fp:
+            json.dump(metadata, fp)
+
+        
         with torch.inference_mode():
             with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
                 text_model.to(device).eval()
@@ -122,7 +142,7 @@ def main(cfg: DictConfig):
 
         text_model.to("cpu")
         torch.cuda.empty_cache()
-
+        sample_count = 0
         per_prompt_images = []
         for idx in trange(0, cfg.batch_size, mini_batch_size):
             c_mask, c_id, c_tensor = context_mask[idx : idx + mini_batch_size], context_position_ids[idx : idx + mini_batch_size], context_tensor[idx : idx + mini_batch_size]
@@ -146,6 +166,10 @@ def main(cfg: DictConfig):
         images *= 255.0
         images = images.numpy().astype(np.uint8)
         pil_images = [Image.fromarray(image) for image in images]
+        for sample in pil_images:
+            sample.save(os.path.join(sample_path, f"{sample_count:05}.png"))
+            sample_count += 1
+
         rows = [[cfg.cfg, cfg.pag_scale, wandb.Image(image), prompt] for i, image in enumerate(pil_images)]
         columns = ["cfg", "pag", "image", "text"]
 
@@ -158,7 +182,6 @@ def main(cfg: DictConfig):
         wandb.save(str(out_dir) + "/*", policy="end")
 
     total_time = time.time() - start_time
-    log.info(f"Generate {len(validation_prompts)} images take {total_time:2f}s.")
 
 
 if __name__ == "__main__":

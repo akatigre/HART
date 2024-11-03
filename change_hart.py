@@ -132,7 +132,7 @@ def change_hart_infer(model: HARTForT2I):
             # Cond, Uncond, PAG | Cond, PAG | Cond, Uncond | Cond
             if cfg_scale > 1.0 and pag_scale > 0.0:
                 cond, uncond, pag = logits_BlV.chunk(3)
-                logits_BlV = (2 + gamma - omega) * cond - gamma * uncond + omega * pag
+                logits_BlV = (1 + gamma - omega) * cond - gamma * uncond + omega * pag
             elif cfg_scale > 1.0:
                 cond, uncond = logits_BlV.chunk(2)
                 logits_BlV = (1 + gamma) * cond - gamma * uncond
@@ -146,9 +146,6 @@ def change_hart_infer(model: HARTForT2I):
             if si == 0:
                 logits_BlV = logits_BlV[:, [-1], :]
 
-            topk_logits = logits_BlV.topk(100, dim=-1)
-            extras["logit_hist_vals"].append(topk_logits.values)
-            extras["logit_hist_inds"].append(topk_logits.indices)
             idx_Bl = sample_with_top_k_top_p_(
                 logits_BlV,
                 rng=rng,
