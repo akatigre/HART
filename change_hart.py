@@ -33,6 +33,9 @@ def change_hart_infer(model: HARTForT2I):
         num_maskgit_iters=1,
         pag_scale:int = 0.0,
         cfg_scale:int = 1.5,
+        cd_alpha: float = 0.0,
+        cd_beta: float = 0.0,
+        dynamic_scale: str = "linear",
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         
         if g_seed is None:
@@ -98,10 +101,18 @@ def change_hart_infer(model: HARTForT2I):
             b.attn.kv_caching(True)
 
         extras = defaultdict(list)
+        N = len(self.patch_nums)
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
             num_stages_minus_1 = len(self.patch_nums) - 1
-            ratio = si / num_stages_minus_1 
-
+            
+            if dynamic_scale == "linear":
+                ratio = si / num_stages_minus_1
+            elif dynamic_scale == "cosine":
+                ratio = np.cos(math.pi / 2.0 * si / num_stages_minus_1)
+            elif dynamic_scale == "reverse_linear":
+                ratio = 1 - si / num_stages_minus_1
+            else:
+                dynamic_scale = 1.0
             if si > 0:
                 cur_L += pn * pn
             else:
@@ -129,13 +140,25 @@ def change_hart_infer(model: HARTForT2I):
             #* Apply CFG or PAG
             gamma = cfg_scale * ratio
             omega = pag_scale * ratio
+            psi = cd_beta * ratio
             # Cond, Uncond, PAG | Cond, PAG | Cond, Uncond | Cond
             if cfg_scale > 1.0 and pag_scale > 0.0:
                 cond, uncond, pag = logits_BlV.chunk(3)
-                logits_BlV = (1 + gamma - omega) * cond - gamma * uncond + omega * pag
+                logits_BlV = (1 + gamma) * cond - gamma * uncond # + omega * pag
+                if cd_beta > 0.0:
+                    cutoff = math.log(cd_alpha) + logits_BlV.max(dim=-1, keepdim=True).values
+                    diffs = (1 + psi) * logits_BlV - psi * pag
+                    logits_BlV = diffs.masked_fill(logits_BlV < cutoff, -float('inf'))
+
             elif cfg_scale > 1.0:
                 cond, uncond = logits_BlV.chunk(2)
-                logits_BlV = (1 + gamma) * cond - gamma * uncond
+                
+                if cd_beta > 0.0:
+                    cutoff = math.log(cd_alpha) + cond.max(dim=-1, keepdim=True).values
+                    diffs = (1 + psi) * cond - psi * uncond
+                    logits_BlV = diffs.masked_fill(cond < cutoff, -float('inf'))
+                else:
+                    logits_BlV = (1 + gamma) * cond - gamma * uncond
             elif pag_scale > 0.0:
                 cond, pag = logits_BlV.chunk(2)
                 logits_BlV = (1 - omega) * cond + omega * pag
@@ -230,12 +253,22 @@ def change_hart_infer(model: HARTForT2I):
             omega = pag_scale * ratio
             # Cond, Uncond, PAG | Cond, PAG | Cond, Uncond | Cond
             if cfg_scale > 1.0 and pag_scale > 0.0:
-                # cond logit + (1 - gamma) * (uncond - cond) + cond logit + omega * (pag_logit - cond logit)
                 cond, uncond, pag = logits_BlV.chunk(3)
-                logits_BlV = (2 + gamma - omega) * cond - gamma * uncond + omega * pag
+                logits_BlV = (1 + gamma) * cond - gamma * uncond # + omega * pag
+                if cd_beta > 0.0:
+                    cutoff = math.log(cd_alpha) + logits_BlV.max(dim=-1, keepdim=True).values
+                    diffs = (1 + psi) * logits_BlV - psi * pag
+                    logits_BlV = diffs.masked_fill(logits_BlV < cutoff, -float('inf'))
+
             elif cfg_scale > 1.0:
                 cond, uncond = logits_BlV.chunk(2)
-                logits_BlV = (1 + gamma) * cond - gamma * uncond
+                
+                if cd_beta > 0.0:
+                    cutoff = math.log(cd_alpha) + cond.max(dim=-1, keepdim=True).values
+                    diffs = (1 + psi) * cond - psi * uncond
+                    logits_BlV = diffs.masked_fill(cond < cutoff, -float('inf'))
+                else:
+                    logits_BlV = (1 + gamma) * cond - gamma * uncond
             elif pag_scale > 0.0:
                 cond, pag = logits_BlV.chunk(2)
                 logits_BlV = (1 - omega) * cond + omega * pag
@@ -639,7 +672,7 @@ def change_hart_attn(model: LlamaAttention):
             if si != 0 and self.context_token > 0:
                 attention_mask_pag = torch.zeros(q.size(2), k.size(2), device=x.device)
                 attention_mask_pag[ : , self.context_token : -q.size(2)] = float("-inf")
-                
+
             dropout_p = self.attn_drop if self.training else 0.0
 
             oup_pag = (

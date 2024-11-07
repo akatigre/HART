@@ -3,7 +3,7 @@ program: sample.py
 method: grid  # or bayes, random
 parameters:
   pag_scale:
-    values: [0.0, 0.3, 0.6, 0.9]
+    values: [0.0]
   cfg:
     values: [3.0, 4.0, 5.0]
   layer_types: 

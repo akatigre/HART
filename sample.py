@@ -100,7 +100,7 @@ def main(cfg: DictConfig):
             block.attn = change_hart_attn(block.attn)
     log.info("Change HART model for PAG")
     
-    mini_batch_size = 2
+    mini_batch_size = 1
     assert cfg.batch_size % mini_batch_size == 0
     start_time = time.time()
     for p_idx, prompt in tqdm(enumerate(validation_prompts)):
@@ -126,7 +126,7 @@ def main(cfg: DictConfig):
         per_prompt_images = []
         for idx in trange(0, cfg.batch_size, mini_batch_size):
             c_mask, c_id, c_tensor = context_mask[idx : idx + mini_batch_size], context_position_ids[idx : idx + mini_batch_size], context_tensor[idx : idx + mini_batch_size]
-
+            breakpoint()
             with torch.inference_mode():
                 with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
                     
@@ -141,6 +141,8 @@ def main(cfg: DictConfig):
                         context_mask = c_mask, # 2, 300 [T, ..., T, F, ...., F]
                     )
                     per_prompt_images.append(images.clone().permute(0, 2, 3, 1).cpu())
+                    del images
+                    torch.cuda.empty_cache()
 
         images = torch.cat(per_prompt_images, dim=0)
         images *= 255.0
