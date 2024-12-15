@@ -36,6 +36,7 @@ def change_hart_infer(model: HARTForT2I):
         cd_alpha: float = 0.0,
         cd_beta: float = 0.0,
         dynamic_scale: str = "linear",
+        dola = True,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         
         if g_seed is None:
@@ -133,6 +134,7 @@ def change_hart_infer(model: HARTForT2I):
                     cfg_scale = cfg_scale,
                     pag_scale = pag_scale,
                 )
+                #! cfg 를 쓰면 jsd 의 값이 갈수록 커지나? 
             logits_BlV = self.get_logits(x, cond_BD)
             if si == self.num_stages_minus_1:
                 last_layer_cond = x
@@ -159,6 +161,7 @@ def change_hart_infer(model: HARTForT2I):
                     logits_BlV = diffs.masked_fill(cond < cutoff, -float('inf'))
                 else:
                     logits_BlV = (1 + gamma) * cond - gamma * uncond
+            
             elif pag_scale > 0.0:
                 cond, pag = logits_BlV.chunk(2)
                 logits_BlV = (1 - omega) * cond + omega * pag
@@ -231,7 +234,8 @@ def change_hart_infer(model: HARTForT2I):
             cur_mask = torch.cat([mask_to_pred] * (bsz // B), dim=0)
             cur_mask = cur_mask.nonzero(as_tuple=True)
             x = next_token_map[cur_mask].reshape(bsz, -1, self.C)
-            for b in self.blocks:
+            layer_logits = {}
+            for blck_idx, b in enumerate(self.blocks):
                 # Haotian: si used for position embed
                 # note: m_maskgit makes sure that PEs are correct.
                 x = b(
@@ -245,12 +249,17 @@ def change_hart_infer(model: HARTForT2I):
                     cfg_scale = cfg_scale,
                     pag_scale = pag_scale,
                 )
+                layer_logits[blck_idx] = self.get_logits(x, cond_BD)
             logits_BlV = self.get_logits(x, cond_BD)
+            if dola:
+                candidate_layer_idxs = [0, 2, 4, 6, 8]
+                premature_layers = torch.stack([layer_logits[i] for i in candidate_layer_idxs])
+            
             last_layer_cond = x
 
-            #* Apply CFG or PAG
             gamma = cfg_scale * ratio
             omega = pag_scale * ratio
+            psi = cd_beta * ratio
             # Cond, Uncond, PAG | Cond, PAG | Cond, Uncond | Cond
             if cfg_scale > 1.0 and pag_scale > 0.0:
                 cond, uncond, pag = logits_BlV.chunk(3)
@@ -449,7 +458,7 @@ except ImportError:
             if dropout_p > 0
             else attn.softmax(dim=-1)
         ) @ value
-    
+  
 def change_hart_attn(model: LlamaAttention):
     def forward(
         self,
@@ -462,7 +471,6 @@ def change_hart_attn(model: LlamaAttention):
         cfg_scale: float = 1.5,
         pag_scale: float = 0.0,
     ):
-        
         # cond, uncond, pag | cond, uncond | cond, pag | cond
         pm = None
         if cfg_scale > 1.0 and pag_scale > 0.0:
@@ -475,6 +483,7 @@ def change_hart_attn(model: LlamaAttention):
             context_position_ids = torch.cat([cond_context_position_ids, uncond_context_position_ids], dim=0)
             # x = (2 + cfg_scale - pag_scale) * cond - cfg_scale * uncond + pag_scale * pag
             x = torch.cat([cond, uncond], dim=0)
+        
         elif cfg_scale > 1.0:
             cond, uncond = x.chunk(2, dim=0)
             # x = (1 + cfg_scale) * cond - cfg_scale * uncond

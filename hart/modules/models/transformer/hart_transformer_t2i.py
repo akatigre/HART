@@ -5,6 +5,7 @@ This file is adopted and modified from https://github.com/FoundationVision/VAR/b
 
 import math
 import os
+from einops import rearrange
 from functools import partial
 from typing import Optional, Tuple, Union
 
@@ -242,8 +243,6 @@ class HARTForT2I(PreTrainedModel):
         fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
 
-        # 5. attention mask used in training (for masking out the future)
-        #    it won't be used in inference, since kv cache is enabled
         d: torch.Tensor = torch.cat(
             [torch.full((context_token,), 0)]
             + [
@@ -302,228 +301,50 @@ class HARTForT2I(PreTrainedModel):
     def autoregressive_infer_cfg(
         self,
         B: int,
-        label_B: Optional[Union[int, torch.LongTensor]],
-        g_seed: Optional[int] = None,
+        next_token_map,
+        f_hat,
+        lvl_pos,
+        cond_BD,
+        cond_BD_or_gss,
+        ratio,
+        rng,
         cfg=1.5,
         top_k=0,
         top_p=0.0,
-        more_smooth=False,
+        more_smooth=False, # gumbel softmax ; do not use for FID / IS
         context_position_ids: torch.Tensor = None,
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
-        """
-        only used for inference, on autoregressive mode
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
-        """
-        # num_maskgit_iters = 1
-        # final_stage = 2
-        if g_seed is None:
-            rng = None
-        else:
-            self.rng.manual_seed(g_seed)
-            rng = self.rng
-        assert label_B is not None
-        assert label_B.shape[1] == self.context_token
-
-        sos = cond_BD = self.context_embed(
-            self.context_norm(
-                torch.cat((label_B, torch.full_like(label_B, fill_value=0.0)), dim=0)
-            )
-        )
-        # Haotian: need to handle CFG here so we replicate context position ids
-        context_position_ids = torch.cat(
-            (context_position_ids, torch.full_like(context_position_ids, fill_value=0)),
-            dim=0,
-        )
-
-        b = context_mask.shape[0]
-        context_mask = torch.cat(
-            (context_mask, torch.full_like(context_mask, fill_value=0))
-        )
-        context_mask[b:, 0] = 1
-
-        if self.pos_1LC is not None:
-            lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        else:
-            lvl_pos = self.lvl_embed(self.lvl_1L)
-
-        if self.pos_start is not None:
-            next_token_map = (
-                sos.expand(2 * B, self.first_l, -1)
-                + self.pos_start.expand(2 * B, self.first_l, -1)
-                + lvl_pos[:, : self.first_l]
-            )
-        else:
-            next_token_map = (
-                sos.expand(2 * B, self.first_l, -1) + lvl_pos[:, : self.first_l]
-            )
 
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-
         for b in self.blocks:
             b.attn.kv_caching(True)
+
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
-            ratio = si / self.num_stages_minus_1
-            # last_L = cur_L
-            if si > 0:
-                cur_L += pn * pn
-            else:
-                cur_L += self.context_token
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            x = next_token_map
-            AdaLNSelfAttn.forward
-            for b in self.blocks:
-                # Haotian: si used for position embed
-                x = b(
-                    x=x,
-                    cond_BD=cond_BD_or_gss,
-                    attn_bias=None,
-                    si=si,
-                    context_position_ids=context_position_ids,
-                    context_mask=context_mask,
-                )
-            logits_BlV = self.get_logits(x, cond_BD)
-            if si == self.num_stages_minus_1:
-                last_layer_cond = x
+            f_hat, next_token_map, cur_L = self.single_step(
+                si, pn, rng, more_smooth, context_position_ids, context_mask, cur_L, next_token_map, f_hat, lvl_pos, cond_BD, B, top_p, cfg
+                ) # diffusion residuals
 
-            t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-            # Haotian: Added for text-conditioned generation
-            if si == 0:
-                logits_BlV = logits_BlV[:, [-1], :]
-
-            idx_Bl = sample_with_top_k_top_p_(
-                logits_BlV,
-                rng=rng,
-                top_k=(600 if si < 7 else 300),
-                top_p=top_p,
-                num_samples=1,
-            )[:, :, 0]
-            if not more_smooth:  # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
-            else:  # not used when evaluating FID/IS/Precision/Recall
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
-                h_BChw = gumbel_softmax_with_rng(
-                    logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
-                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-
-            f_hat, next_token_map = self.vae_quant_proxy[
-                0
-            ].get_next_autoregressive_input(
-                si, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
-            )
-
-            next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-            next_token_map = (
-                self.word_embed(next_token_map)
-                + lvl_pos[:, cur_L : cur_L + self.patch_nums[si + 1] ** 2]
-            )
-            next_token_map = next_token_map.repeat(
-                2, 1, 1
-            )  # double the batch sizes due to CFG
-
-        ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
         mask = torch.ones(B, self.last_level_pns).cuda()
         tokens = torch.zeros(B, self.last_level_pns, self.Cvae).cuda()
         orders = self.sample_orders(B)
+        
+        for step in range(num_maskgit_iters):
+            tokens, mask = self.final_stage(
+                tokens, mask, orders, step, 
+                num_maskgit_iters, rng, more_smooth, 
+                context_position_ids, context_mask, ratio, 
+                cfg, top_p, next_token_map, cond_BD, B, 
+                cond_BD_or_gss, final_stage
+                ) # maskgit tokens
 
-        num_iter = num_maskgit_iters
-        indices = list(range(num_iter))
-        # generate latents with maskgit
-        for step in indices:
-            # mask_ratio = 1 - (step + 1) / num_iter
-            mask_ratio = np.cos(math.pi / 2.0 * (step + 1) / num_iter)
-            mask_len = torch.Tensor([np.floor(self.last_level_pns * mask_ratio)]).cuda()
-            # masks out at least one for the next iteration
-            mask_len = torch.maximum(
-                torch.Tensor([1]).cuda(),
-                torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len),
-            )
-            # get masking for next iteration and locations to be predicted in this iteration
-            mask_next = mask_by_order(mask_len[0], orders, B, self.last_level_pns)
-            if step >= num_iter - 1:
-                mask_to_pred = mask[:B].bool()
-            else:
-                mask_to_pred = torch.logical_xor(mask[:B].bool(), mask_next.bool())
-            mask = mask_next
-            cur_mask = torch.cat([mask_to_pred, mask_to_pred], dim=0)
-            cur_mask = cur_mask.nonzero(as_tuple=True)
-            x = next_token_map[cur_mask].reshape(2 * B, -1, self.C)
-            for b in self.blocks:
-                # Haotian: si used for position embed
-                # note: m_maskgit makes sure that PEs are correct.
-                x = b(
-                    x=x,
-                    cond_BD=cond_BD_or_gss,
-                    attn_bias=None,
-                    si=len(self.patch_nums) - 1,
-                    m_maskgit=cur_mask,
-                    context_position_ids=context_position_ids,
-                    context_mask=context_mask,
-                )
-            logits_BlV = self.get_logits(x, cond_BD)
-            last_layer_cond = x
-            t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-            si = len(self.patch_nums) - 1
-            idx_Bl = sample_with_top_k_top_p_(
-                logits_BlV,
-                rng=rng,
-                top_k=(600 if si < 7 else 300),
-                top_p=top_p,
-                num_samples=1,
-            )[:, :, 0]
-            if not more_smooth:  # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
-            else:  # not used when evaluating FID/IS/Precision/Recall
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
-                h_BChw = gumbel_softmax_with_rng(
-                    logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
-                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            if final_stage == 0:
-                # sample with diffusion model
-                last_stage_discrete_cond = self.vae_quant_proxy[0].embedding(idx_Bl)
-                last_stage_discrete_cond = self.word_embed(last_stage_discrete_cond)
-                last_stage_discrete_cond = torch.cat(
-                    [last_stage_discrete_cond, last_stage_discrete_cond], dim=0
-                )
-                last_stage_cond = self.decoder_norm(
-                    last_layer_cond + last_stage_discrete_cond
-                )
-                bs, cur_seq_len, _ = last_stage_cond.shape
-                ##### begin baseline sampling #####
-                last_stage_cond = last_stage_cond.reshape(bs * cur_seq_len, -1)
-                h_BChw_diff = self.diffloss.sample(
-                    z=last_stage_cond, temperature=1.0, cfg=t
-                )
-                ##### end baseline sampling #####
-                h_BChw_diff = h_BChw_diff.reshape(bs, cur_seq_len, -1)
-                # [B, L, Cvae]
-                h_BChw_diff, _ = h_BChw_diff.chunk(2, dim=0)
-                # update feature map
-                tokens[mask_to_pred] = (h_BChw + h_BChw_diff).reshape(-1, self.Cvae)
-            else:
-                tokens[mask_to_pred] = h_BChw.reshape(-1, self.Cvae)
         h_BChw_final = tokens.transpose(1, 2).reshape(
             B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1]
         )
         f_hat += h_BChw_final
-
-        ################ last stage maskgit ################
 
         for b in self.blocks:
             b.attn.kv_caching(False)
@@ -531,6 +352,37 @@ class HARTForT2I(PreTrainedModel):
             self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
         )  # de-normalize, from [-1, 1] to [0, 1]
 
+
+    def single_step(self, 
+                    decode_func, si, ratio, context_position_ids, context_mask, next_token_map, 
+                    cond_BD, cfg):
+        """
+            Discrete next scale prediction
+            Predicts into VQ codebook
+        """
+        x = next_token_map
+
+        for b in self.blocks:
+
+            x = b(
+                x=x,
+                cond_BD=self.shared_ada_lin(cond_BD),
+                attn_bias=None,
+                si=si, # for positional embedding of different resolutions
+                context_position_ids=context_position_ids,
+                context_mask=context_mask,
+            )
+        last_hidden_state = x
+        logits_BlV = self.get_logits(last_hidden_state, cond_BD)
+        logits_cond, logits_uncond = logits_BlV.chunk(2, dim=0)
+        logits_BlV = decode_func(logit_cond=logits_cond, logit_uncond=logits_uncond, scale=cfg * ratio)
+
+        # Haotian: Added for text-conditioned generation
+        if si == 0:
+            logits_BlV = logits_BlV[:, [-1], :]
+        
+        return last_hidden_state, logits_BlV
+    
     def sample_orders(self, bsz):
         # generate a batch of random generation orders
         orders = []
@@ -561,6 +413,48 @@ class HARTForT2I(PreTrainedModel):
         mask_full = torch.cat([mask_keep, mask], dim=1).contiguous()
         return mask_full, mask
 
+    def final_stage(self, mask, orders, step, num_iter, context_position_ids, context_mask, ratio, cfg, next_token_map, cond_BD, B, cond_BD_or_gss, decode_func):
+        """
+            Residual token prediction to make the discrete into continuous tokens
+
+        """
+        # mask_ratio = 1 - (step + 1) / num_iter
+        mask_ratio = np.cos(math.pi / 2.0 * (step + 1) / num_iter)
+        mask_len = torch.Tensor([np.floor(self.last_level_pns * mask_ratio)]).cuda()
+        # masks out at least one for the next iteration
+        mask_len = torch.maximum(
+            torch.Tensor([1]).cuda(),
+            torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len),
+        )
+        # get masking for next iteration and locations to be predicted in this iteration
+        mask_next = mask_by_order(mask_len[0], orders, B, self.last_level_pns)
+        if step >= num_iter - 1:
+            mask_to_pred = mask[:B].bool()
+        else:
+            mask_to_pred = torch.logical_xor(mask[:B].bool(), mask_next.bool())
+        
+        mask = mask_next
+        cur_mask = torch.cat([mask_to_pred, mask_to_pred], dim=0)
+        cur_mask = cur_mask.nonzero(as_tuple=True)
+        x = next_token_map[cur_mask].reshape(2 * B, -1, self.C)
+        for b in self.blocks:
+            x = b(
+                x=x,
+                cond_BD=cond_BD_or_gss,
+                attn_bias=None,
+                si=len(self.patch_nums) - 1,
+                m_maskgit=cur_mask,
+                context_position_ids=context_position_ids,
+                context_mask=context_mask,
+            )
+        last_hidden_state = x
+        logits_BlV = self.get_logits(x, cond_BD)
+        
+        t = cfg * ratio
+        logits_BlV = decode_func(logit_cond=logits_BlV[:B], logit_uncond=logits_BlV[B:], scale=t)
+        
+        return last_hidden_state, logits_BlV, mask_to_pred
+    
     def forward(
         self,
         context: torch.Tensor,

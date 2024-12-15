@@ -1,30 +1,27 @@
-
-import copy
-import json
 import os
+import copy
 import time
 import torch
-from tqdm import tqdm, trange
-from PIL import Image 
 import numpy as np
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    HfArgumentParser,
-    set_seed,
-)
+from PIL import Image 
+from tqdm import trange
+from pathlib import Path
+from torchvision.utils import make_grid
 
 from utils import set_seed, load_metadata
+from transformers import AutoTokenizer, AutoModel
 from hart.utils import encode_prompts, llm_system_prompt
-from change_hart import change_hart_infer, change_hart_block, change_hart_attn
+from hart.modules.models.transformer.hart_transformer_t2i import HARTForT2I
+
 import hydra
-from omegaconf import DictConfig, OmegaConf
+import decode
+import json
+from generate import generate
+from omegaconf import DictConfig
 
 import logging
 from rich.logging import RichHandler
-from pathlib import Path
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -41,27 +38,19 @@ def main(cfg: DictConfig):
     log.info(f"Set seed {cfg.seed}")
     model_params = cfg.model_params
     assert model_params.model_name == "hart", "Model name should be hart"
-    
-    enable_pag = cfg.pag_scale > 0.0
-    enable_cfg = cfg.cfg_scale > 1.0
-    enable_cd = cfg.cd_beta > 0.0 and cfg.cd_alpha < 1.0
-    log.info(f"Enable PAG: {enable_pag}, Enable CFG: {enable_cfg}, Enable CD: {enable_cd}")
-
     # Create folder to save images
-    folder_name = "generated"
-    output_path = str(Path(cfg.benchmark.outdirs) / cfg.model_params.model_name)
-    if enable_pag: 
-        folder_name += f"_pag:{cfg.pag_scale}_layer:{cfg.layer_types}"
-        output_path += f"_PAG_{cfg.pag_scale}"
-    if enable_cfg: 
-        folder_name += f"_cfg{cfg.cfg_scale}_{cfg.dynamic_scale}"
-        output_path += f"_CFG_{cfg.cfg_scale}_{cfg.dynamic_scale}"
-    if enable_cd: 
-        folder_name += f"_cd{cfg.cd_alpha}:{cfg.cd_beta}"
-        output_path += f"_CD_{cfg.cd_alpha}:{cfg.cd_beta}"
+    if cfg.teacher_force:
+        folder_name = f"reconstructed/{cfg.model_params.model_name}/{cfg.decode}{cfg.cfg_scale}_tf{cfg.teacher_force_upto*100}"
+    else:
+        folder_name = f"generated/{cfg.model_params.model_name}/{cfg.decode}{cfg.cfg_scale}"
+
+    if cfg.update_logits:
+        assert cfg.decode == "vanilla", "Update logits is only supported for vanilla decode"
+        folder_name += f"_update_logits"
 
     device = torch.device("cuda")
-    model = AutoModel.from_pretrained(cfg.model_params.model_path) # HARTForT2I
+    
+    model = HARTForT2I.from_pretrained(cfg.model_params.model_path)
     model = model.to(device)
     model.eval()
 
@@ -77,52 +66,42 @@ def main(cfg: DictConfig):
     text_tokenizer = AutoTokenizer.from_pretrained(cfg.model_params.text_model_path)
     text_model = AutoModel.from_pretrained(cfg.model_params.text_model_path)
 
-    #! Change layer forward functions to support PAG
-    decoder_layers = ema_model.blocks
-    
-    if cfg.layer_types=="all":
-        layer_idxs = range(len(decoder_layers))
-    elif cfg.layer_types=="early":
-        layer_idxs = range(len(decoder_layers) // 3)
-    elif cfg.layer_types=="middle":
-        layer_idxs = range(len(decoder_layers) // 3, 2 * len(decoder_layers) // 3)
-    elif cfg.layer_types=="late":
-        layer_idxs = range(2 * len(decoder_layers) // 3, len(decoder_layers))
-    log.info(f"Total layers : {len(decoder_layers)}, Changing layers: {layer_idxs}")
-
-    ema_model = change_hart_infer(ema_model)
-    for b_idx, block in enumerate(decoder_layers):
-        block = change_hart_block(block)
-        if b_idx in layer_idxs:
-            block.attn = change_hart_attn(block.attn)
-    log.info("Change HART model for PAG")
-
-    batch_size = cfg.benchmark.batch
+    decode_func = getattr(decode, f"{cfg.decode}_decode")
     val_prompts, metadatas = load_metadata(cfg)
     categories = val_prompts.get("categories", None)
+    batch_size = 1
+    N = len(val_prompts['prompts'])
     # load from users passed arguments
-    start_time = time.time()
-    for idx, (prompt, name) in tqdm(enumerate(zip(val_prompts['prompts'], val_prompts['name'])), desc="Generating images"):
-        
-        cat = categories[idx] if categories is not None else None
-        outpath = Path(output_path) / name if cat is None else Path(output_path) / cat / name
+
+    for start_idx in trange(0, N, batch_size):
+        gt_path = None
         if cfg.benchmark.name=="geneval":
-            os.makedirs(outpath, exist_ok=True)
-            with open(os.path.join(outpath, "metadata.jsonl"), "w") as fp:
-                json.dump(metadatas[idx], fp)
+            prompts = val_prompts['prompts'][start_idx: start_idx + batch_size]
+            names = val_prompts['name'][start_idx: start_idx + batch_size]
+            save_path = [Path(cfg.benchmark.outdirs) / folder_name / name for name in names if not (Path(cfg.benchmark.outdirs) / folder_name / name).exists()]
+            metas = metadatas[start_idx: start_idx + batch_size]
+            for save, metadata in zip(save_path[::4], metas[::4]):
+                os.makedirs(save.parent, exist_ok=True)
+                with open(os.path.join(save.parent, "metadata.jsonl"), "w") as fp:
+                    json.dump(metadata, fp)
 
-            if len(os.listdir(outpath)) > batch_size:
-                continue
+        elif cfg.benchmark.name=="dpgbench":
+            prompts = val_prompts['prompts'][start_idx: start_idx + batch_size]
+            names = val_prompts['name'][start_idx: start_idx + batch_size]
+            save_path = [Path(cfg.benchmark.outdirs) / folder_name / name for name in names if not (Path(cfg.benchmark.outdirs) / folder_name / name).exists()]
 
-        elif cfg.benchmark.name=="mjhq" or cfg.benchmark.name=="dpgbench":
-            os.makedirs(outpath.parent, exist_ok=True)
-            if os.path.exists(outpath):
-                continue
+        elif cfg.benchmark.name=="mjhq":
+            cats = categories[start_idx: start_idx + batch_size] if categories is not None else None
+            gt_path = [Path(cfg.benchmark.outdirs).parent / 'root' / cat / name for cat, name in zip(cats, names)]
+            save_path = [Path(cfg.benchmark.outdirs) / folder_name / cat / name for cat, name in zip(cats, names) if not (Path(cfg.benchmark.outdirs) / folder_name / cat / name).exists()]
+            for save in save_path:
+                os.makedirs(save.parent, exist_ok=True)
         else:
             raise ValueError(f"benchmark name {cfg.benchmark.name} not supported.")
         
-        log.info(f"With Prompt '{prompt}' generating {batch_size} images")
-        prompts = [prompt] * batch_size
+        if not len(save_path):
+            continue
+        start_time = time.time()
         with torch.inference_mode():
             with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
                 text_model.to(device).eval()
@@ -134,69 +113,85 @@ def main(cfg: DictConfig):
                     cfg.model_params.max_token_length,
                     llm_system_prompt,
                     cfg.model_params.use_llm_system_prompt,
-                )
+                ) # tokenize prompts with text model
 
                 text_model.to("cpu")
-                torch.cuda.empty_cache()
-
-                mini_batch = 2
-                batched_imgs =  []
-                assert batch_size < mini_batch or batch_size % mini_batch == 0
-                for mini in range(0, batch_size, mini_batch):
-                    ctx = context_tensor[mini : mini + mini_batch]
-                    ctx_mask = context_mask[mini : mini + mini_batch]
-                    ctx_pos_ids = context_position_ids[mini : mini + mini_batch]
-                    
-                    images, extras, sampled_ids = ema_model.autoregressive_infer_cfg(
-                        B = ctx.size(0),
-                        label_B = ctx, # 2, 300, d
-                        cfg_scale = cfg.cfg_scale,
-                        pag_scale = cfg.pag_scale,
-                        g_seed = cfg.seed+mini,
-                        more_smooth = cfg.model_params.more_smooth,
-                        context_position_ids = ctx_pos_ids, # 2, 300 padding on the right [0, ... 39, 40, 40, ..., 40]
-                        context_mask = ctx_mask, # 2, 300 [T, ..., T, F, ...., F]
-                        dynamic_scale = cfg.dynamic_scale,
-                        cd_alpha = cfg.cd_alpha,
-                        cd_beta = cfg.cd_beta,
+                
+                sos = cond_BD = ema_model.context_embed(
+                    ema_model.context_norm(
+                        torch.cat((context_tensor, torch.full_like(context_tensor, fill_value=0.0)), dim=0)
                     )
+                ) # embed the prompt tokens 
 
-                    images = (images.clone().cpu() * 255.0) 
-                    batched_imgs.append(images)
-                images = torch.cat(batched_imgs, dim=0)
+                context_position_ids = torch.cat(
+                    (context_position_ids, torch.full_like(context_position_ids, fill_value=0)),
+                    dim=0,
+                ) # position ids for prompt tokens
 
-        if cfg.benchmark.name=="geneval":
-            images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-            pil_images = [Image.fromarray(image) for image in images]
-            sample_count = 0
-            for sample in pil_images:
-                sample.save(os.path.join(outpath, f"{sample_count:05}.png"))
-                sample_count += 1
-            # (Path(outpath) / str(sample_count)).mkdir(exist_ok=True)
-            # torch.save(extras, Path(outpath) / str(sample_count) / "extras.pt")
-            # torch.save(sampled_ids, Path(outpath) / str(sample_count)/ "generated_tokens.pt")
-        elif cfg.benchmark.name=="dpgbench":
-            from torchvision.utils import make_grid
-            images = make_grid(images, nrow=2) # BCHW
-            images = images.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-            images = Image.fromarray(images)
-            images.save(outpath)
-            # (Path(outpath.parent) / outpath.stem).mkdir(exist_ok=True)
-            # torch.save(extras, Path(outpath.parent) / outpath.stem / "extras.pt")
-            # torch.save(sampled_ids, Path(outpath.parent) / outpath.stem / "generated_tokens.pt")
-        elif cfg.benchmark.name=="mjhq":
-            images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-            images = Image.fromarray(images[0])
-            images.save(outpath)
-            # (Path(outpath.parent) / outpath.stem).mkdir(exist_ok=True)
-            # torch.save(extras, Path(outpath.parent) / outpath.stem / "extras.pt")
-            # torch.save(sampled_ids, Path(outpath.parent) / outpath.stem / "generated_tokens.pt")
+                B = context_mask.shape[0]
+                context_mask = torch.cat(
+                    (context_mask, torch.full_like(context_mask, fill_value=0))
+                )
+                context_mask[B:, 0] = 1 
+
+                if ema_model.pos_1LC is not None:
+                    lvl_pos = ema_model.lvl_embed(ema_model.lvl_1L) + ema_model.pos_1LC
+                else:
+                    lvl_pos = ema_model.lvl_embed(ema_model.lvl_1L)
+
+                if ema_model.pos_start is not None:
+                    next_token_map = (
+                        sos.expand(2 * B, ema_model.first_l, -1)
+                        + ema_model.pos_start.expand(2 * B, ema_model.first_l, -1)
+                        + lvl_pos[:, : ema_model.first_l]
+                    )
+                else:
+                    next_token_map = (
+                        sos.expand(2 * B, ema_model.first_l, -1) + lvl_pos[:, : ema_model.first_l]
+                    )
+            
+                images = generate(sos, B, 
+                                  ema_model, 
+                                  quantizer = ema_model.vae_quant_proxy[0],
+                                  context_tensor = context_tensor, 
+                                  context_position_ids = context_position_ids, 
+                                  context_mask = context_mask, 
+                                  cond_BD = cond_BD, 
+                                  lvl_pos = lvl_pos, 
+                                  next_token_map = next_token_map, 
+                                  rng = None, 
+                                  nonmyopic = cfg.nonmyopic, 
+                                  cfg = cfg.model_params, 
+                                  decode_func = decode_func, 
+                                  cfg_scale = cfg.cfg_scale,
+                                  update_logits = cfg.update_logits,
+                                  )
+        end_time = time.time()
+        images = (images.clone().cpu() * 255.0)
+
+        for i in range(len(save_path)):
+            if not save_path[i].parent.exists():
+                save_path[i].parent.mkdir(parents=True, exist_ok=True)
+                
+        log.info(f"Time taken: {end_time - start_time} seconds")
+        if cfg.benchmark.name=="dpgbench":
+            per_prompt_images.extend([image for image in images])
+            for img_idx in range(0, len(per_prompt_images), cfg.benchmark.batch):
+                images = make_grid(per_prompt_images[img_idx: img_idx + cfg.benchmark.batch], nrow=2)
+                images = images.permute(1, 2, 0).cpu().numpy().astype('uint8')
+                images = Image.fromarray(images)
+                save_path[img_idx].parent.mkdir(parents=True, exist_ok=True)
+                images.save(save_path[img_idx])
+            per_prompt_images = []
         else:
-            raise ValueError(f"benchmark name {cfg.benchmark.name} not supported.")
-        log.info(f"Generated image saved at {outpath}")
+            images = images.permute(0, 2, 3, 1).cpu().numpy().astype("uint8")
+            pil_images = [Image.fromarray(image) for image in images]
+            for save_at, image in zip(save_path, pil_images):
+                save_at.parent.mkdir(parents=True, exist_ok=True)
+                image.save(save_at)
 
-    total_time = time.time() - start_time
-    log.info(f"Total time taken: {total_time} Prompt numbers: {len(val_prompts)}")
+        log.info(f"Generated {prompts}, saved into {save_path}")
+        break
 
 if __name__ == "__main__":
     try:

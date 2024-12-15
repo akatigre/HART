@@ -10,7 +10,6 @@ import torch
 from transformers import set_seed as hf_set_seed
 
 def set_seed(seed):
-    
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -18,7 +17,6 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     hf_set_seed(seed)
-
 
 
 def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
@@ -45,8 +43,10 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
     with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
         f.write("\n".join(prompts))
 
-
 def load_metadata(cfg):
+    """
+        load text_prompts and metadatas repeated by the required number of generations for each benchmark dataset
+    """
     val_prompts = defaultdict(list)
     
     prompt_path = cfg.benchmark.prompts
@@ -56,22 +56,22 @@ def load_metadata(cfg):
             full_path = os.path.join(prompt_path, p)
             with open(full_path, 'r') as f:
                 line = f.read().splitlines()[0]
-            val_prompts["name"].append(p.replace("txt", "png"))
-            val_prompts["prompts"].append(line)
+            val_prompts["name"].extend([p.replace("txt", "png")] * cfg.benchmark.batch)
+            val_prompts["prompts"].extend([line] * cfg.benchmark.batch)
         metadatas = None
         
     elif cfg.benchmark.name=="geneval":
         with open(prompt_path) as f:
-            metadatas = [json.loads(line) for line in f]
+            metadatas = [json.loads(line) for line in f for _ in range(cfg.benchmark.batch)]
         val_prompts["prompts"] = [metadata['prompt'] for metadata in metadatas]
-        val_prompts["name"] = [f"{idx:0>5}" for idx in range(len(val_prompts["prompts"]))]
+        val_prompts["name"] = [f"{idx:0>5}/{img_idx:05}.png" for idx in range(len(val_prompts["prompts"])) for img_idx in range(cfg.benchmark.batch)]
         
     elif cfg.benchmark.name=="mjhq":
         with open(prompt_path, "r") as f:
             metadatas = json.load(f)
         file_names = sorted(list(metadatas.keys()))
         
-        val_prompts["name"] = [file_name + ".png" for file_name in file_names]
+        val_prompts["name"] = [file_name + ".jpg" for file_name in file_names]
         val_prompts["prompts"] = [metadatas[filename]["prompt"] for filename in file_names]
         val_prompts["categories"] = [metadatas[filename]["category"] for filename in file_names]
         
