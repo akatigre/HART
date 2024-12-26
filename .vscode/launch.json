@@ -8,13 +8,15 @@
             "name": "Python Debugger: Current File with Arguments",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "debug.py",
             "console": "integratedTerminal",
+            "justMyCode": false,
             "args": [
                 "model_params=hart",
                 "benchmark=geneval",
-                "decode=vanilla",
-                "update_logits=true",
+                "decode=yjk_test",
+                "cfg_scale=5",
+                "yjk.do_langevin_dynamics=false",
             ]
         }
     ]

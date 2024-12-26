@@ -8,46 +8,25 @@ from hart.modules.networks.utils import (
 )
 from hart.modules.models.autoencoder import HARTHybridQuantizer
 import decode
+from decode import sample_ste
+from hart.utils import encode_prompts, llm_system_prompt
 
-
-def compute_constraint_loss(logits, cond_BD, next_token_map):
-    """
-    Compute the constraint-based loss for MuCoCo.
-
-    Args:
-        logits (Tensor): The logits from the current token prediction.
-        cond_BD: Condition based on prefix tokens.
-        next_token_map: Mapping for the next token predictions.
-
-    Returns:
-        Tensor: The computed loss based on constraints.
-    """
-    # Example implementation (to be customized based on actual constraints)
-    # This is a placeholder and should be replaced with actual constraint logic
-    loss = 0.0
-
-    # Example constraint: Penalize tokens not in next_token_map
-    # Assuming next_token_map is a mask of allowed tokens
-    allowed_tokens = next_token_map  # Boolean mask
-    loss += torch.mean((1 - allowed_tokens.float()) * torch.log_softmax(logits, dim=-1))
-
-    return loss
-
-def generate(sos, B, 
-             ema_model: HARTForT2I, 
-             quantizer: HARTHybridQuantizer,
-             context_tensor, context_position_ids, context_mask, 
-             cond_BD, # prefix conditional tokens
-             lvl_pos, next_token_map, rng, cfg, cfg_scale, 
-             decode_func: Callable, 
-             nonmyopic:bool = False,
-             more_smooth:bool = False,
-             final_stage:int = 0,
-             num_maskgit_iters:int = 1,
-             top_k = 0, 
-             top_p = 0.0,
-             update_logits:bool = False,
-             ):
+def generate_images(sos, B, 
+            ema_model: HARTForT2I, 
+            quantizer: HARTHybridQuantizer,
+            context_tensor, context_position_ids, context_mask, 
+            cond_BD, # prefix conditional tokens
+            lvl_pos, next_token_map, rng, cfg, cfg_scale, 
+            decode_func: Callable, 
+            more_smooth:bool = False,
+            final_stage:int = 0,
+            num_maskgit_iters:int = 1,
+            top_k = 0, 
+            top_p = 0.0,
+            soft:bool = False,
+            do_langevin_dynamics: bool = False,
+            epsilon: torch.Tensor = None,
+            ):
     #! predict discrete tokens into f_hat
     f_hat = sos.new_zeros(B, ema_model.Cvae, ema_model.patch_nums[-1], ema_model.patch_nums[-1]) # tokens to be predicted
     B = context_tensor.size(0)
@@ -64,35 +43,47 @@ def generate(sos, B,
         ratio = si / ema_model.num_stages_minus_1
         
         # 2. Get logits at si
-        _, logits_BlV = ema_model.single_step(
-            decode_func = decode_func, 
-            si = si, 
-            ratio = ratio,
-            context_position_ids = context_position_ids, 
-            context_mask = context_mask, 
-            next_token_map = next_token_map, 
-            cond_BD = cond_BD, 
-            cfg = cfg_scale,
-        )
-        
+        with torch.inference_mode():
+            _, logits_BlV = ema_model.single_step(
+                decode_func = decode_func, 
+                si = si, 
+                ratio = ratio,
+                context_position_ids = context_position_ids, 
+                context_mask = context_mask, 
+                next_token_map = next_token_map, 
+                cond_BD = cond_BD, 
+                cfg = cfg_scale,
+                epsilon = epsilon if do_langevin_dynamics else None
+            )
         # 3. Sample token index with top-k and top-p
-        idx_Bl = sample_with_top_k_top_p_(
-            logits_BlV,
-            rng=rng,
+        logits_BlV, num_samples, replacement = sample_with_top_k_top_p_(
+            logits_BlV.clone().detach(),
             top_k=(600 if si < 7 else 300),
             top_p=top_p,
             num_samples=1,
-        )[:, :, 0]
+        )
         
-        if not more_smooth:
-            # this is the default case
-            h_BChw = quantizer.embedding(idx_Bl)  # B, l, Cvae
+        B, l, V = logits_BlV.shape
+        idx_Bl = torch.multinomial(
+            logits_BlV.softmax(dim=-1).view(-1, V),
+            num_samples=num_samples,
+            replacement=replacement,
+            generator=rng,
+        ).view(B, l, num_samples)[:, :, 0]
+        if soft: # straight-through estimator
+            idx_onehot = torch.nn.functional.one_hot(idx_Bl, num_classes=V)
+            idx_onehot = idx_onehot + logits_BlV.detach() - logits_BlV
+            h_BChw = idx_onehot @ quantizer.embedding.weight
         else:
-            # not used when evaluating FID/IS/Precision/Recall
-            gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
-            h_BChw = gumbel_softmax_with_rng(
-                logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
-            ) @ quantizer.embedding.weight.unsqueeze(0)
+            if not more_smooth:
+                # this is the default case
+                h_BChw = quantizer.embedding(idx_Bl)  # B, l, Cvae
+            else:
+                # not used when evaluating FID/IS/Precision/Recall
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
+                h_BChw = gumbel_softmax_with_rng(
+                    logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
+                ) @ quantizer.embedding.weight.unsqueeze(0)
 
         h_BChw = h_BChw.transpose_(1, 2).reshape(B, ema_model.Cvae, pn, pn)
 
@@ -115,27 +106,8 @@ def generate(sos, B,
     mask = torch.ones(B, ema_model.last_level_pns).cuda()
     tokens = torch.zeros(B, ema_model.last_level_pns, ema_model.Cvae).cuda()
     orders = ema_model.sample_orders(B)
-    
-    last_hidden_state, logits_BlV, mask_to_pred = ema_model.final_stage(
-        mask = mask, 
-        orders = orders, 
-        step = 0, 
-        num_iter = num_maskgit_iters, 
-        context_position_ids = context_position_ids, 
-        context_mask = context_mask, 
-        ratio = ratio, 
-        cfg = cfg_scale, 
-        next_token_map = next_token_map, 
-        cond_BD = cond_BD, 
-        B = B, 
-        cond_BD_or_gss = ema_model.shared_ada_lin(cond_BD), 
-        decode_func = decode_func
-        ) # maskgit tokens
-    if update_logits:
-        bias = torch.nn.Parameter(torch.randn_like(last_hidden_state) * 0.25)
-        optimizer = torch.optim.Adam([bias], lr=0.025)
-        max_iterations = 10
-        func = lambda x: ema_model.final_stage(
+    with torch.inference_mode():
+        last_hidden_state, logits_BlV, mask_to_pred = ema_model.final_stage(
             mask = mask, 
             orders = orders, 
             step = 0, 
@@ -144,41 +116,40 @@ def generate(sos, B,
             context_mask = context_mask, 
             ratio = ratio, 
             cfg = cfg_scale, 
-            next_token_map = x, 
+            next_token_map = next_token_map, 
             cond_BD = cond_BD, 
             B = B, 
             cond_BD_or_gss = ema_model.shared_ada_lin(cond_BD), 
-            decode_func = getattr(decode, "cfg_decode")
-        )[0] # maskgit tokens
-        for _ in range(max_iterations):
-            optimizer.zero_grad()
-            # global ground truth 는 얻기 어렵다 -> CFG logits 을 최대화?
-            h = last_hidden_state + bias
-            logits = ema_model.get_logits(h)
-            soft_forward(func = func, 
-                         onehot = torch.nn.functional.one_hot(torch.argmax(logits, dim=-1)),
-                         logits = logits
-                         )
-            # P(x1, x2, x3 | c) = P(x1 | c)P(x2 | x1, c)P(x3 | x1, x2, c)
-            # How to derive the joint logit
-            loss.backward()
-            optimizer.step()
+            decode_func = decode_func
+            ) # maskgit tokens
         
         
-    idx_Bl = sample_with_top_k_top_p_(
-        logits_BlV,
-        rng=rng,
+    logits_BlV, num_samples, replacement = sample_with_top_k_top_p_(
+        logits_BlV.clone().detach(),
         top_k = top_k,
         top_p = top_p,
         num_samples=1,
-    )[:, :, 0]
-    if not more_smooth:  # this is the default case
-        h_BChw = quantizer.embedding(idx_Bl)  # B, l, Cvae
-    else:  # not used when evaluating FID/IS/Precision/Recall
-        gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
-        h_BChw = gumbel_softmax_with_rng(
-            logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
-        ) @ quantizer.embedding.weight.unsqueeze(0)
+    )
+    
+    B, l, V = logits_BlV.shape
+    idx_Bl = torch.multinomial(
+        logits_BlV.softmax(dim=-1).view(-1, V),
+        num_samples=num_samples,
+        replacement=replacement,
+        generator=rng,
+    ).view(B, l, num_samples)[:, :, 0]
+    if soft: # straight-through estimator
+        idx_onehot = torch.nn.functional.one_hot(idx_Bl, num_classes=V)
+        idx_onehot = idx_onehot + logits_BlV.detach() - logits_BlV
+        h_BChw = idx_onehot @ quantizer.embedding.weight
+    else:        
+        if not more_smooth:  # this is the default case
+            h_BChw = quantizer.embedding(idx_Bl)  # B, l, Cvae
+        else:  # not used when evaluating FID/IS/Precision/Recall
+            gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
+            h_BChw = gumbel_softmax_with_rng(
+                logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
+            ) @ quantizer.embedding.weight.unsqueeze(0)
     
     if final_stage == 0:
         # sample with diffusion model
@@ -215,3 +186,60 @@ def generate(sos, B,
         
     images = ema_model.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
     return images
+
+def prepare_embeds(
+    text_model,
+    text_tokenizer,
+    ema_model,
+    prompts,
+    cfg,
+    device
+):
+    
+    text_model.to(device).eval()
+
+    _, context_mask, context_position_ids, context_tensor = encode_prompts(
+        prompts,
+        text_model,
+        text_tokenizer,
+        cfg.model_params.max_token_length,
+        llm_system_prompt,
+        cfg.model_params.use_llm_system_prompt,
+    ) # tokenize prompts with text model
+
+    text_model.to("cpu")
+    
+    cond_BD = ema_model.context_embed(
+        ema_model.context_norm(
+            torch.cat((context_tensor, torch.full_like(context_tensor, fill_value=0.0)), dim=0)
+        )
+    ) # embed the prompt tokens 
+    sos = cond_BD.clone()
+    context_position_ids = torch.cat(
+        (context_position_ids, torch.full_like(context_position_ids, fill_value=0)),
+        dim=0,
+    ) # position ids for prompt tokens
+
+    B = context_mask.shape[0]
+    context_mask = torch.cat(
+        (context_mask, torch.full_like(context_mask, fill_value=0))
+    )
+    context_mask[B:, 0] = 1 
+
+    if ema_model.pos_1LC is not None:
+        lvl_pos = ema_model.lvl_embed(ema_model.lvl_1L) + ema_model.pos_1LC
+    else:
+        lvl_pos = ema_model.lvl_embed(ema_model.lvl_1L)
+
+    if ema_model.pos_start is not None:
+        next_token_map = (
+            sos.expand(2 * B, ema_model.first_l, -1)
+            + ema_model.pos_start.expand(2 * B, ema_model.first_l, -1)
+            + lvl_pos[:, : ema_model.first_l]
+        )
+    else:
+        next_token_map = (
+            sos.expand(2 * B, ema_model.first_l, -1) + lvl_pos[:, : ema_model.first_l]
+        )
+
+    return context_tensor, context_position_ids, context_mask, cond_BD, lvl_pos, next_token_map, sos, B

@@ -57,24 +57,5 @@ def adaptive_decode(self, input_ids: torch.LongTensor, scores: torch.FloatTensor
     scores_processed = scores.masked_fill(indices_to_remove, filter_value)
     return scores_processed
 
-def soft_forward(model, x_onehot, y_logits, x_past=None, detach=True):
-    '''
-    computes logits for $y$, based on a fixed context $y$ and the current logit distribution of $y$
-    :param model:
-    :param x_onehot:
-    :param y_logits:
-    :return:
-    '''
-    xy_embeds = embed_inputs(
-        model.get_input_embeddings().weight,
-        y_logits,
-        x_onehot=x_onehot,
-        device=x_onehot.device
-    )
-    xy_logits = model(past_key_values=x_past, inputs_embeds=xy_embeds).logits
-    x_length = x_onehot.shape[1]
-    y_logits = xy_logits[:, x_length - 1:-1, :]
-    if detach:
-        return y_logits.detach()
-    else:
-        return y_logits
+def sample_ste(logits_BlV, rng=None, top_k=None, top_p=None, num_samples=1):
+    return None, None

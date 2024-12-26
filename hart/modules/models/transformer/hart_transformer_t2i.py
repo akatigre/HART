@@ -355,7 +355,7 @@ class HARTForT2I(PreTrainedModel):
 
     def single_step(self, 
                     decode_func, si, ratio, context_position_ids, context_mask, next_token_map, 
-                    cond_BD, cfg):
+                    cond_BD, cfg, epsilon = None):
         """
             Discrete next scale prediction
             Predicts into VQ codebook
@@ -373,6 +373,8 @@ class HARTForT2I(PreTrainedModel):
                 context_mask=context_mask,
             )
         last_hidden_state = x
+        if epsilon is not None:
+            last_hidden_state = last_hidden_state + epsilon
         logits_BlV = self.get_logits(last_hidden_state, cond_BD)
         logits_cond, logits_uncond = logits_BlV.chunk(2, dim=0)
         logits_BlV = decode_func(logit_cond=logits_cond, logit_uncond=logits_uncond, scale=cfg * ratio)

@@ -10,13 +10,13 @@ from torchvision.utils import make_grid
 
 from utils import set_seed, load_metadata
 from transformers import AutoTokenizer, AutoModel
-from hart.utils import encode_prompts, llm_system_prompt
+
 from hart.modules.models.transformer.hart_transformer_t2i import HARTForT2I
 
 import hydra
 import decode
 import json
-from generate import generate
+from generate import generate_images, prepare_embeds
 from omegaconf import DictConfig
 
 import logging
@@ -104,68 +104,33 @@ def main(cfg: DictConfig):
         start_time = time.time()
         with torch.inference_mode():
             with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
-                text_model.to(device).eval()
-
-                _, context_mask, context_position_ids, context_tensor = encode_prompts(
-                    prompts,
-                    text_model,
-                    text_tokenizer,
-                    cfg.model_params.max_token_length,
-                    llm_system_prompt,
-                    cfg.model_params.use_llm_system_prompt,
-                ) # tokenize prompts with text model
-
-                text_model.to("cpu")
-                
-                sos = cond_BD = ema_model.context_embed(
-                    ema_model.context_norm(
-                        torch.cat((context_tensor, torch.full_like(context_tensor, fill_value=0.0)), dim=0)
-                    )
-                ) # embed the prompt tokens 
-
-                context_position_ids = torch.cat(
-                    (context_position_ids, torch.full_like(context_position_ids, fill_value=0)),
-                    dim=0,
-                ) # position ids for prompt tokens
-
-                B = context_mask.shape[0]
-                context_mask = torch.cat(
-                    (context_mask, torch.full_like(context_mask, fill_value=0))
+                context_tensor, context_position_ids, context_mask, cond_BD, lvl_pos, next_token_map, sos, B = prepare_embeds(
+                    prompts, 
+                    text_tokenizer, 
+                    text_model, 
+                    ema_model, 
+                    cfg, 
+                    device
                 )
-                context_mask[B:, 0] = 1 
-
-                if ema_model.pos_1LC is not None:
-                    lvl_pos = ema_model.lvl_embed(ema_model.lvl_1L) + ema_model.pos_1LC
-                else:
-                    lvl_pos = ema_model.lvl_embed(ema_model.lvl_1L)
-
-                if ema_model.pos_start is not None:
-                    next_token_map = (
-                        sos.expand(2 * B, ema_model.first_l, -1)
-                        + ema_model.pos_start.expand(2 * B, ema_model.first_l, -1)
-                        + lvl_pos[:, : ema_model.first_l]
+                images = generate_images(
+                    sos, 
+                    B, 
+                    ema_model, 
+                    quantizer = ema_model.vae_quant_proxy[0],
+                    context_tensor = context_tensor, 
+                    context_position_ids = context_position_ids, 
+                    context_mask = context_mask, 
+                    cond_BD = cond_BD, 
+                    lvl_pos = lvl_pos, 
+                    next_token_map = next_token_map, 
+                    rng = None, 
+                    nonmyopic = cfg.nonmyopic, 
+                    cfg = cfg.model_params, 
+                    decode_func = decode_func, 
+                    cfg_scale = cfg.cfg_scale,
+                    update_logits = cfg.update_logits
                     )
-                else:
-                    next_token_map = (
-                        sos.expand(2 * B, ema_model.first_l, -1) + lvl_pos[:, : ema_model.first_l]
-                    )
-            
-                images = generate(sos, B, 
-                                  ema_model, 
-                                  quantizer = ema_model.vae_quant_proxy[0],
-                                  context_tensor = context_tensor, 
-                                  context_position_ids = context_position_ids, 
-                                  context_mask = context_mask, 
-                                  cond_BD = cond_BD, 
-                                  lvl_pos = lvl_pos, 
-                                  next_token_map = next_token_map, 
-                                  rng = None, 
-                                  nonmyopic = cfg.nonmyopic, 
-                                  cfg = cfg.model_params, 
-                                  decode_func = decode_func, 
-                                  cfg_scale = cfg.cfg_scale,
-                                  update_logits = cfg.update_logits,
-                                  )
+
         end_time = time.time()
         images = (images.clone().cpu() * 255.0)
 
