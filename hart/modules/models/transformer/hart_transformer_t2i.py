@@ -248,7 +248,7 @@ class HARTForT2I(PreTrainedModel):
             + [
                 torch.full((pn * pn,), i + 1)
                 for i, pn in enumerate(self.patch_nums[1:])
-            ]
+            ] # 0 x 300, 1 x 4, 2 x 9, 3 x 16, 4 x 25, 5 x 36, ..., 12 x 4096
         ).view(1, self.L + context_token - 1, 1)
         dT = d.transpose(1, 2)  # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
@@ -259,14 +259,11 @@ class HARTForT2I(PreTrainedModel):
         self.register_buffer(
             "attn_bias_for_masking", attn_bias_for_masking.contiguous()
         )
-        print(attn_bias_for_masking.shape)
 
         # 6. classifier head
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
-
         self.decoder_norm = norm_layer(self.C)
-        # self.diffusion_pos_embed_learned = nn.Parameter(torch.zeros(1, self.last_level_pns, self.C))
 
         self.diffloss = DiffLoss(
             target_channels=self.Cvae,
@@ -355,7 +352,7 @@ class HARTForT2I(PreTrainedModel):
 
     def single_step(self, 
                     decode_func, si, ratio, context_position_ids, context_mask, next_token_map, 
-                    cond_BD, cfg, epsilon = None):
+                    cond_BD, cfg):
         """
             Discrete next scale prediction
             Predicts into VQ codebook
@@ -373,12 +370,11 @@ class HARTForT2I(PreTrainedModel):
                 context_mask=context_mask,
             )
         last_hidden_state = x
-        if epsilon is not None:
-            last_hidden_state = last_hidden_state + epsilon
+        
         logits_BlV = self.get_logits(last_hidden_state, cond_BD)
         logits_cond, logits_uncond = logits_BlV.chunk(2, dim=0)
         logits_BlV = decode_func(logit_cond=logits_cond, logit_uncond=logits_uncond, scale=cfg * ratio)
-
+        
         # Haotian: Added for text-conditioned generation
         if si == 0:
             logits_BlV = logits_BlV[:, [-1], :]
@@ -541,7 +537,6 @@ class HARTForT2I(PreTrainedModel):
         cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
 
-        AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
             if self.gradient_checkpointing:
                 x_BLC = self._gradient_checkpointing_func(

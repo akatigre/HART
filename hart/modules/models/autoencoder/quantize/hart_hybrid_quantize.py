@@ -196,12 +196,8 @@ class HARTHybridQuantizer(VARQuantizer):
                 F.interpolate(h_BChw, size=(HW, HW), mode="bicubic")
             )  # conv after upsample
             f_hat.add_(h)
-            return f_hat, F.interpolate(
-                f_hat,
-                size=(patch_nums[si + 1], patch_nums[si + 1]),
-                mode="area",
-            )
+            return f_hat
         else:
             h = h_BChw
             f_hat.add_(h)
-            return f_hat, f_hat
+            return f_hat

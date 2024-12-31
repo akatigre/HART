@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import torch
 from torch.nn import functional as F
-
+ 
 def cfg_decode(
     logit_cond,
     logit_uncond,
@@ -12,22 +12,6 @@ def cfg_decode(
     **kwargs
     ):
     logits = (1 + scale) * logit_cond - scale * logit_uncond 
-    return logits
-
-def vanilla_decode(
-    logit_cond,
-    **kwargs
-    ):
-    return logit_cond
-
-def myopic_decode(
-    logit_cond,
-    logit_uncond,
-    scale,
-    forward_func,
-    **kwargs
-    ):
-    logits = logit_uncond
     return logits
 
 def adaptive_decode(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, ada: float = 0.01, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1) -> torch.FloatTensor:
@@ -56,6 +40,3 @@ def adaptive_decode(self, input_ids: torch.LongTensor, scores: torch.FloatTensor
     indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
     scores_processed = scores.masked_fill(indices_to_remove, filter_value)
     return scores_processed
-
-def sample_ste(logits_BlV, rng=None, top_k=None, top_p=None, num_samples=1):
-    return None, None

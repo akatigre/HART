@@ -11,12 +11,16 @@
             "program": "debug.py",
             "console": "integratedTerminal",
             "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2"
+            },
             "args": [
                 "model_params=hart",
                 "benchmark=geneval",
                 "decode=yjk_test",
                 "cfg_scale=5",
-                "yjk.do_langevin_dynamics=false",
+                "yjk.k_filter=10",
+                "yjk.do_langevin_dynamics=true",
             ]
         }
     ]

@@ -7,7 +7,6 @@ def sample_with_top_k_top_p_(
     logits_BlV: torch.Tensor,
     top_k: int = 0,
     top_p: float = 0.0,
-    num_samples=1,
 ) -> torch.Tensor:  # return idx, shaped (B, l)
     if top_k > 0:
         idx_to_remove = logits_BlV < logits_BlV.topk(
@@ -26,10 +25,7 @@ def sample_with_top_k_top_p_(
             ),
             -torch.inf,
         )
-    # sample (have to squeeze cuz torch.multinomial can only be used for 2D tensor)
-    replacement = num_samples >= 0
-    num_samples = abs(num_samples)
-    return logits_BlV, num_samples, replacement
+    return logits_BlV
 
 
 

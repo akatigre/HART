@@ -1000,11 +1000,11 @@ class LlamaAttention(nn.Module):
             if si == -1:
                 _position_ids = get_position_ids(
                     B, self.patch_nums[1:], x.device, si=si, m_maskgit=m_maskgit
-                )
+                ) # 2, 9450, 1
                 # largest position_id
                 position_ids = _position_ids + context_position_ids[:, -1].unsqueeze(
                     -1
-                ).unsqueeze(-1)
+                ).unsqueeze(-1) # 2, 1, 1
             elif si > 0:
                 _position_ids = get_position_ids(
                     B, self.patch_nums[1:], x.device, si=si - 1, m_maskgit=m_maskgit
@@ -1018,8 +1018,8 @@ class LlamaAttention(nn.Module):
         #     context_position_ids = get_position_ids_1d(B, self.context_token, x.device)
 
         qkv = F.linear(
-            input=x,
-            weight=self.qkv_proj.weight,
+            input=x, # 1, 5355 (l), 32 -> 1536
+            weight=self.qkv_proj.weight, # 4608, 1536
             bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias)),
         ).view(B, L, 3, self.num_heads, self.head_dim)
         main_type = qkv.dtype
