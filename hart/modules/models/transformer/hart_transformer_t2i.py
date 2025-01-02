@@ -261,7 +261,7 @@ class HARTForT2I(PreTrainedModel):
         )
 
         # 6. classifier head
-        self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
+        self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer)
         self.head = nn.Linear(self.C, self.V)
         self.decoder_norm = norm_layer(self.C)
 

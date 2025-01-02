@@ -5,14 +5,15 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Current File with Arguments",
+            "name": "Python Debugger: Current File",
             "type": "debugpy",
             "request": "launch",
-            "program": "debug.py",
+            "program": "/home/server08/yoonjeon_workspace/MMAR/hart/debug.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "CUDA_VISIBLE_DEVICES": "2"
+                "CUDA_VISIBLE_DEVICES": "2",
+                "CONDA_PREFIX": "/home/server44/anaconda3/envs/hart"
             },
             "args": [
                 "model_params=hart",

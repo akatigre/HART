@@ -44,15 +44,15 @@ def prepare_embeds(
     else:
         lvl_pos = ema_model.lvl_embed(ema_model.lvl_1L)
 
+    
     if ema_model.pos_start is not None:
-        next_token_map = (
+        sos = (
             sos.expand(2 * B, ema_model.first_l, -1)
             + ema_model.pos_start.expand(2 * B, ema_model.first_l, -1)
             + lvl_pos[:, : ema_model.first_l]
         )
+        
     else:
-        next_token_map = (
-            sos.expand(2 * B, ema_model.first_l, -1) + lvl_pos[:, : ema_model.first_l]
-        )
+        sos = sos.expand(2 * B, ema_model.first_l, -1) + lvl_pos[:, : ema_model.first_l]
 
-    return context_tensor, context_position_ids, context_mask, cond_BD, lvl_pos, next_token_map, sos, B
+    return context_tensor, context_position_ids, context_mask, cond_BD, lvl_pos, B, sos

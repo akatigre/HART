@@ -2,7 +2,7 @@ import os
 import copy
 import torch
 from PIL import Image 
-
+from torch.nn import functional as F
 
 from utils import set_seed
 from transformers import AutoTokenizer, AutoModel
@@ -13,12 +13,12 @@ import hydra
 from decode import cfg_decode
 from token_embed import prepare_embeds
 from generate import generate_images
-from yjk import image_decode, soft_forward_cfg
+from yjk import teacher_forced_decoding
 from omegaconf import DictConfig
 
 import logging
 from rich.logging import RichHandler 
-
+from generate import residual_stage
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -29,13 +29,14 @@ log = logging.getLogger("rich")
 log.setLevel(logging.INFO)
 
 
-@hydra.main(config_path="../configs", config_name="config")
+@hydra.main(config_path="./configs", config_name="config")
 def main(cfg: DictConfig):
     set_seed(cfg.seed)
     log.info(f"Set seed {cfg.seed}")
     model_params = cfg.model_params
     assert model_params.model_name == "hart", "Model name should be hart"
     folder_name = "debug"
+    gen_images = True
     device = torch.device("cuda")
     
     model = HARTForT2I.from_pretrained(cfg.model_params.model_path)
@@ -57,7 +58,7 @@ def main(cfg: DictConfig):
     prompts = ["a bench", "a cow", "a bicycle", "a clock"]
     idx = 3
     with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
-        context_tensor, context_position_ids, context_mask, cond_BD, lvl_pos, next_token_map, sos, B = prepare_embeds(
+        context_tensor, context_position_ids, context_mask, cond_BD, lvl_pos, B, sos= prepare_embeds(
             text_model,
             text_tokenizer, 
             ema_model, 
@@ -67,68 +68,65 @@ def main(cfg: DictConfig):
         )
         del text_model, text_tokenizer
         torch.cuda.empty_cache()
-        images, hidden_state_list, logits_list, filter_list = generate_images(
-            sos, 
-            B, 
-            ema_model = ema_model, 
-            quantizer = quantizer,
-            context_tensor = context_tensor, 
-            context_position_ids = context_position_ids, 
-            context_mask = context_mask, 
-            cond_BD = cond_BD, 
-            lvl_pos = lvl_pos, 
-            next_token_map = next_token_map, 
-            rng = None, 
-            decode_func = cfg_decode, 
-            cfg_scale = cfg.cfg_scale,
-            ) 
+        with torch.no_grad():
+            images, hidden_state_list, logits_list, indices_list = generate_images( 
+                B, 
+                ema_model = ema_model, 
+                quantizer = quantizer, 
+                context_position_ids = context_position_ids, 
+                context_mask = context_mask, 
+                cond_BD = cond_BD, 
+                lvl_pos = lvl_pos, 
+                sos = sos, 
+                rng = None, 
+                decode_func = cfg_decode, 
+                cfg_scale = cfg.cfg_scale,
+                )
         images = (images.clone().cpu() * 255.0)
         images = images.permute(0, 2, 3, 1).cpu().numpy().astype("uint8")
         pil_images = [Image.fromarray(image) for image in images]
         img_name = f"{prompts[idx]}_cfg_{cfg.cfg_scale}_original"
-        pil_images[0].save(f"{folder_name}/{img_name}_testing.png")
-
+        pil_images[0].save(f"{folder_name}/{img_name}.png")
+        del images, pil_images
+        torch.cuda.empty_cache()
+        
         if cfg.yjk.do_langevin_dynamics:
-            torch.cuda.empty_cache()
-            hidden_state_init = torch.cat(hidden_state_list[1:], dim=1) # B, 9450 (ema_model.L), 1536 (ema_model.Cvae)
-            # logits_init = torch.cat(logits_list[1:], dim=1) # B, 9450 (ema_model.L), 4096 (ema_model.V)
-            topk_init = torch.cat(filter_list[1:], dim=1) # B, 9450 (ema_model.L), 4096 (ema_model.V)
-            
-            bias = torch.nn.Parameter(
-                torch.randn(
-                    2 * B, ema_model.L - 1, ema_model.C, device=device
-                    ) * cfg.yjk.start_noise
-                ) # patch_nums: 1, 2, 3, 4, 5, ..., 64
+            biases_list = [
+                    torch.nn.Parameter(
+                        torch.randn_like(
+                            logits_list[i]
+                            ) * cfg.yjk.start_noise
+                        ) for i in range(len(logits_list))
+                        ]     
             optim = torch.optim.AdamW(
-                [bias], 
+                biases_list,
                 lr = cfg.yjk.stepsize,
                 weight_decay = cfg.yjk.weight_decay,
             )
+            best_loss = torch.inf
             for it in range(cfg.yjk.update_iters):
                 optim.zero_grad()
-                loss, selected_tokens = soft_forward_cfg(
-                    ema_model, 
-                    epsilon = bias, 
-                    hidden_states = hidden_state_init.detach().clone().to(device),
-                    logits = None, # logits_init.detach().clone().to(device), 
-                    topk_mask = topk_init.detach().clone().to(device),
-                    context_position_ids = context_position_ids.detach().clone().to(device),
-                    context_mask = context_mask.detach().clone().to(device),
-                    cond_BD = cond_BD.detach().clone().to(device),
+                loss = teacher_forced_decoding(
+                    model = ema_model, 
+                    quantizer = ema_model.vae_quant_proxy[0],
+                    auto_encoder = ema_model.vae_proxy[0],
+                    patch_nums = ema_model.patch_nums,
+                    logits_list = [logits.detach() for logits in logits_list],
+                    biases_list = biases_list,
+                    gt_indices_list = [indices.detach() for indices in indices_list],
+                    cond_BD = cond_BD.detach(),
                     cfg_scale = cfg.cfg_scale,
-                    quantizer = quantizer,
+                    context_position_ids = context_position_ids.detach(),
+                    context_mask = context_mask.detach(),
+                    topk = cfg.yjk.topk,
                 )
+                if loss < best_loss:
+                    best_loss = loss
+                    
                 loss.backward()
+                log.info(f"Iteration {it} loss: {loss.item()} bias grad: {biases_list[0].grad.sum().item()}")
+                torch.cuda.empty_cache()
                 optim.step()
-                log.info(f"Iteration {it} loss: {loss.item()}")
-            bias = bias.detach().cpu()
-            
-            images = (images.clone().cpu() * 255.0)
-            images = images.permute(0, 2, 3, 1).cpu().numpy().astype("uint8")
-            pil_images = [Image.fromarray(image) for image in images]
-            img_name = f"{prompts[idx]}_cfg_{cfg.cfg_scale}"
-            img_name += "_energy" if cfg.yjk.do_langevin_dynamics else "_original"
-            pil_images[0].save(f"{folder_name}/{img_name}.png")
 
 
 if __name__ == "__main__":
