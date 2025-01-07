@@ -214,7 +214,7 @@ class VectorQuantizer2(nn.Module):
                 h_BChw = ms_h_BChw[si]
                 if si < len(patch_nums) - 1:
                     h_BChw = F.interpolate(h_BChw, size=(H, W), mode="bicubic")
-                h_BChw = self.quant_resi[si / (SN - 1)](h_BChw)
+                    h_BChw = self.quant_resi[si / (SN - 1)](h_BChw)
                 f_hat.add_(h_BChw)
                 if last_one:
                     ls_f_hat_BChw = f_hat

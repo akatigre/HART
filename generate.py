@@ -24,10 +24,6 @@ def generate_images(
     num_samples: int = 1,
     rng = None,
     ):
-    """
-        epsilon [torch.Tensor]: parameters to be optimized, shape: B, Cvae, patch_nums[-1], patch_nums[-1], same shape as f_hat
-    """
-    #! predict discrete tokens into f_hat
     f_hat = sos.new_zeros(B, ema_model.Cvae, ema_model.patch_nums[-1], ema_model.patch_nums[-1]) # tokens to be predicted
     
     for b in ema_model.blocks:
@@ -38,6 +34,7 @@ def generate_images(
     indices_list = []
     # for si, pn in enumerate(ema_model.patch_nums[:-1]):
     next_token_map = sos
+    
     for si, pn in enumerate(ema_model.patch_nums):
         #* predict discrete tokens
         # 1. Count the number of tokens at si
@@ -65,17 +62,18 @@ def generate_images(
         if si == 0:
             logits_BlV = logits_BlV[:, [-1], :] # only use the last prediction
         logits_list.append(logits_BlV.detach())
-        logits_BlV = sample_with_top_k_top_p_(
-            logits_BlV,
-            top_k = (600 if si < 7 else 300),
-            top_p = top_p
-        ) # mask vocabularies by in-place operation #! fixed
-        idx_Bl = torch.multinomial(
-            logits_BlV.softmax(dim=-1).view(-1, ema_model.V),
-            num_samples=abs(num_samples),
-            replacement=(num_samples >= 0),
-            generator=rng,
-        ).view(B, pn ** 2, num_samples)[:, :, 0]
+        idx_Bl = logits_BlV.argmax(dim=-1).view(B, pn ** 2)
+        # logits_BlV = sample_with_top_k_top_p_(
+        #     logits_BlV,
+        #     top_k = (600 if si < 7 else 300),
+        #     top_p = top_p
+        # ) # mask vocabularies by in-place operation #! fixed
+        # idx_Bl = torch.multinomial(
+        #     logits_BlV.softmax(dim=-1).view(-1, ema_model.V),
+        #     num_samples=abs(num_samples),
+        #     replacement=(num_samples >= 0),
+        #     generator=rng,
+        # ).view(B, pn ** 2, num_samples)[:, :, 0]
         indices_list.append(idx_Bl.detach())
         h_BChw = quantizer.embedding(idx_Bl)  # B, l, Cvae
         if si < len(ema_model.patch_nums) - 1:
