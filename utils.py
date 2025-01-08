@@ -1,4 +1,5 @@
 import os
+import time
 import torchvision
 from PIL import Image
 from collections import defaultdict
@@ -78,3 +79,29 @@ def load_metadata(cfg):
     else:
         raise NotImplementedError(f"Unknown benchmark name: {cfg.benchmark.name}")
     return val_prompts, metadatas
+
+# add timing hooks
+def add_model_hooks(model: torch.nn.Module):
+
+    def start_time_hook(module, input):
+        if hasattr(module, 'stage') and module.stage == "decode":
+            return
+        elif hasattr(module, 'stage') and module.stage == 'prefill':
+            torch.cuda.synchronize()
+            module.__start_time__ = time.time()
+
+    def end_time_hook(module, input, output):
+        if hasattr(module, 'stage') and module.stage == "decode":
+            return
+        elif hasattr(module, 'stage') and module.stage == 'prefill':
+            torch.cuda.synchronize()
+            module.__duration__ = time.time() - module.__start_time__
+            module.stage = "decode"
+
+    if not hasattr(model, '__start_time_hook_handle'):
+        model.__start_time_hook_handle__ = model.register_forward_pre_hook(
+            start_time_hook, )
+
+    if not hasattr(model, '__end_time_hook_handle__'):
+        model.__end_time_hook_handle__ = model.register_forward_hook(
+            end_time_hook, )

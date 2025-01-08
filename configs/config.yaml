@@ -1,6 +1,6 @@
 defaults:
   - benchmark: geneval
-  - model_params: showo
+  - model_params: hart
   - _self_
 
   # TRANSFORMERS_CACHE
@@ -19,7 +19,7 @@ yjk:
   do_langevin_dynamics: true
   weight_decay: 0.00001
   start_noise: 0.5
-  optimizer: 'AdamW'
+  optimizer: 'Adam'
   k_filter: 30
   add_noise: true
 

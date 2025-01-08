@@ -7,10 +7,9 @@ def prepare_embeds(
     text_tokenizer,
     ema_model: HARTForT2I,
     prompts,
-    cfg,
-    device
+    cfg
     ):
-    text_model.to(device).eval()
+    
 
     _, context_mask, context_position_ids, context_tensor = encode_prompts(
         prompts,

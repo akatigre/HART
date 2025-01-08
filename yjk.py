@@ -147,6 +147,7 @@ def soft_forward(
         
         x = next_token_map
         for b in ema_model.blocks:
+            
             x = b(
                 x=x, # B, 300, 1536
                 cond_BD=ema_model.shared_ada_lin(cond_BD), # 2, 300, 1536 => 2, 4, 1536 => 2, 9, 1536
@@ -228,9 +229,7 @@ def soft_forward(
                 logits_cond, logits_uncond = logits_BlV.chunk(2, dim=0)
                 logits_BlV = cfg_decode(logit_cond=logits_cond, logit_uncond=logits_uncond, scale=cfg_scale * ratio)
                 output_logits.append(logits_BlV)
-            
 
-    # h_BChw = h_BChw.permute(0, 2, 1) 
     h_BChw_diff = residual_stage(
         ema_model=ema_model, 
         last_hidden_state=last_hidden_state.detach(),
